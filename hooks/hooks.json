@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|WebSearch|WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'python3 -c 1 >/dev/null 2>&1 && exec python3 -X utf8 \"$0\" \"$@\" || exec python -X utf8 \"$0\" \"$@\"' \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'python3 -c 1 >/dev/null 2>&1 && exec python3 -X utf8 \"$0\" \"$@\" || exec python -X utf8 \"$0\" \"$@\"' \"${CLAUDE_PLUGIN_ROOT}/foreman/foreman.py\" hook",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

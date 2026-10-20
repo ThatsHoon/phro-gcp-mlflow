@@ -1,0 +1,16 @@
+# Breakthrough: find outside ideas for a stuck limit
+
+Find ideas worth one experiment, not a literature review. Output: new or updated entries in `.phro/ledger/idea-bag.md` (format: `references/idea-bag.md`) plus a short summary to the user (in `project.json language`): the limit in one line, a table `IDEA | stage | what | why it can work here | cost | fit`, the recommended first experiment, and sources with their `research/<topic>/sources/<file>:<line>` paths.
+
+## Steps
+1. **Trigger.** Two sweeps closed on the same limit with no gain, no idea in the bag targets the limit, or the user asks for new directions. Take the numbers from MLflow and the ledger, never from memory: the blocking criterion with values, the insight IDs that explain it, what is already ruled out, and the ideas already in the bag (update those, do not re-add). If the user names a technique, map it to a limit first; a technique with no limit to fix goes to "Not added" with one line why.
+2. **Rewrite the limit as a generic problem statement.** Describe the mechanism in general terms ("a classifier that overfits to the majority class on an imbalanced set") with no project data, no names, nothing from `egress.forbidden_terms`. This statement is the only text that leaves the machine.
+3. **Search with the installed `imozuru` skill.** Topic dir `.phro/research/<topic>` (map.md, sources/, report.html live there). Required claims for every candidate method: the mechanism, the measured effect, the failure conditions, the cost at our scale (from `domain.md` hardware and model limits). Stop by imozuru's rules: every needed claim has an original source, saturation, or the 4-week limit. If `imozuru` is not installed, say so, tell the user to install it (it is a separate skill; this plugin does not bundle it), and stop this workflow.
+4. **Write to the bag.** Next free `IDEA-NNN` per kept idea, every field of the entry format, one `evidence:` line per claim as `research/<topic>/sources/<file>:<line> (논문|본인|정리)`, `targets:` naming the L-ID. Score fit H/M/L against `domain.md` constraints (hard constraints violated = L). fit H: targets a measured limit, uses data we have, fits the hardware, first experiment is one axis on an existing run. fit M: plausible but needs new data, more code, or another idea. fit L: one line under "Not added". Describe the mechanism in terms of our evidence, not the paper's headline.
+5. **Break-through experiment** when the user picks an idea (or it is already in `plan.md`): probe (`references/probe.md`) -> one axis against the strongest baseline -> the stats rules of `references/sweep.md`. It still goes through legacy review and the launch rules.
+6. **After the verdict:** update the idea's `status` and `result`, add or flip the insight, and set the L-ID row to `broken` (link the run) or `bound` (with the evidence).
+
+## Privacy
+- Queries, URLs and subagent prompts carry the generic statement of step 2 only. The guard hook blocks WebSearch and WebFetch text that contains any `egress.forbidden_terms` entry, but it does not read subagent prompts: check those yourself.
+- Never put data rows, labels or the project's names into a search or a prompt.
+- Prefer primary sources (proceedings, official repos). Mark claims that rest on secondary summaries `정리` and unverified.

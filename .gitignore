@@ -1,0 +1,8 @@
+# domain packs hold project data; never commit them
+domains/
+.phro/
+# foreman runtime files
+state.json
+reports.jsonl
+ENABLED
+__pycache__/

@@ -1,0 +1,19 @@
+{
+  "name": "example",
+  "language": "ko",
+  "goal": {"kpis": [{"key": "heldout/f1", "target": 0.9, "dir": "max", "source": "requirements.md sec 2"}]},
+  "stages": [
+    {"name": "embed", "experiment": "1_embed", "depends_on": []},
+    {"name": "classify", "experiment": "2_classify", "depends_on": ["embed"]}
+  ],
+  "metrics": [
+    {"key": "heldout/f1", "stage": "classify", "dir": "max", "target": 0.9,
+     "resample_unit": "doc_id", "agg": {"type": "f1", "tp": "tp", "fp": "fp", "fn": "fn"},
+     "gate": {"min_delta": 0.0}}
+  ],
+  "eval_sets": {"select": "dev", "heldout": "heldout", "final": "final", "look_budget": {"heldout": 10, "final": 1}},
+  "server": {"host": "my-gpu", "allow_hosts": ["my-gpu"], "root": "~/phro/proj",
+             "mlflow_port": 5002, "gpus": 4, "venv": "~/phro/proj/venv"},
+  "egress": {"forbidden_terms": ["secret-host"]},
+  "stats": {"seeds_min": 4, "bootstrap": 1000}
+}
