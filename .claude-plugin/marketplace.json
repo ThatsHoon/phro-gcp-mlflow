@@ -1,0 +1,12 @@
+{
+  "name": "phro-gcp-mlflow",
+  "description": "Generic AutoML loop on a GCP GPU VM with MLflow",
+  "owner": { "name": "thatshoon" },
+  "plugins": [
+    {
+      "name": "phro-gcp-mlflow",
+      "source": "./",
+      "description": "Generic AutoML loop on a GCP GPU VM with MLflow: turn a workflow into a domain pack, plan sweeps, run a foreman, record experiments, and search for breakthroughs."
+    }
+  ]
+}

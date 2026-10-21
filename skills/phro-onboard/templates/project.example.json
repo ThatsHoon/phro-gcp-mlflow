@@ -7,6 +7,9 @@
     {"name": "classify", "experiment": "2_classify", "depends_on": ["embed"]}
   ],
   "metrics": [
+    {"key": "dev/f1", "stage": "classify", "dir": "max",
+     "resample_unit": "doc_id", "agg": {"type": "f1", "tp": "tp", "fp": "fp", "fn": "fn"},
+     "gate": {"min_delta": 0.0}},
     {"key": "heldout/f1", "stage": "classify", "dir": "max", "target": 0.9,
      "resample_unit": "doc_id", "agg": {"type": "f1", "tp": "tp", "fp": "fp", "fn": "fn"},
      "gate": {"min_delta": 0.0}}
@@ -15,5 +18,5 @@
   "server": {"host": "my-gpu", "allow_hosts": ["my-gpu"], "root": "~/phro/proj",
              "mlflow_port": 5002, "gpus": 4, "venv": "~/phro/proj/venv"},
   "egress": {"forbidden_terms": ["secret-host"]},
-  "stats": {"seeds_min": 4, "bootstrap": 1000}
+  "stats": {"seeds_min": 4, "bootstrap": 1000, "min_units": 30}
 }

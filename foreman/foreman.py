@@ -5,7 +5,8 @@
   python foreman.py report --summary "..." [--ids all] [--next "run_x.sh GPU2"] [--blocked "사용자 결정 대기: ..."]
   python foreman.py selftest
 상태는 <팩>/.phro/foreman/state.json, 보고 기록은 reports.jsonl. 숫자만 다룬다: 전사·pred 파일은 읽지 않는다.
-훅은 <팩>/.phro/foreman/ENABLED 파일이 있을 때만 일한다. 내용이 "claim"이면 처음 훅을 부른 세션이 주인이 되고, 그 세션만 막는다. 끄려면 ENABLED를 지운다.
+훅은 <팩>/.phro/foreman/ENABLED 파일이 있을 때만 일한다. 내용이 비었거나 "claim"이면 처음 Stop한 세션이 주인이 되고, 그 세션만 막는다.
+주인 세션이 OWNER_STALE_S 동안 Stop이 없으면(끝난 세션) 다음에 Stop한 세션이 넘겨받는다. 끄려면 ENABLED를 지운다.
 """
 import json, os, re, shlex, sys, time
 from pathlib import Path
@@ -19,6 +20,7 @@ CACHE_S = 120  # 점검 결과(실패 포함)를 이만큼 다시 쓴다(턴마�
 ACK_LAUNCH_S = 45 * 60  # 띄웠다고 보고한 빈 GPU는 이만큼 봐준다(모델 적재·평가 대기)
 ACK_BLOCKED_S = 60 * 60  # 못 띄우는 이유를 보고한 빈 GPU
 MAX_SAME_BLOCK = 3  # 같은 이유로 연달아 막은 횟수가 이만큼이면 놓아 준다(풀 수 없는 상태의 무한 반복 방지)
+OWNER_STALE_S = 2 * 3600  # 주인 세션이 이만큼 Stop이 없으면 다른 세션이 주인을 넘겨받는다
 P = None  # 현재 팩(use_pack으로 정한다)
 STATE = REPORTS = PLAN = IDEAS = ENABLED = None
 
@@ -109,6 +111,7 @@ def orders(snap, s, now=None):
         if n:
             L.append(f"- 끝남 `{p}` = 런 `{n}`. 서론의 기대: {expectation(d.get('intro'))}\n"
                      f"  -> `{PHRO} report --run {n}`(또는 compare)로 숫자를 뽑아 기대와 맞았는지 판정하고, `result`·`insight`를 서버 매니페스트에 써라."
+                     f" 채택 여부는 시드가 모이면 `{PHRO} decide <base> <arm>`(같은 시드 쌍)으로만 정한다."
                      + ("" if d.get("intro") else " 서론도 없이 돌렸다. 그것도 써라."))
         else:
             L.append(f"- 스크립트 끝 표시 `{p}`: 그 스크립트가 띄운 런 전부 판정하라.")
@@ -154,20 +157,28 @@ def report(s, summary, ids="all", next_action="", blocked=""):
 
 # ---------- Stop 훅 ----------
 def hook():
-    inp = json.loads(sys.stdin.read() or "{}")
-    p, _ = find(os.environ.get("CLAUDE_PROJECT_DIR") or inp.get("cwd") or None)
+    try:
+        inp = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return
+    if not isinstance(inp, dict):
+        return
+    p, _ = find(phro._real(os.environ.get("CLAUDE_PROJECT_DIR")) or inp.get("cwd") or None)
     if p is None:
         return
     use_pack(p)
-    if not ENABLED.exists():
+    sid = inp.get("session_id", "")
+    if not ENABLED.exists() or not sid:
         return
-    owner, sid = ENABLED.read_text(encoding="utf-8").strip(), inp.get("session_id", "")
-    if owner == "claim" and sid:
+    raw, s, now = ENABLED.read_bytes(), load_state(), time.time()
+    owner = (raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-8-sig", "replace")).strip()  # PowerShell 5.1 > writes UTF-16
+    seen = max(s.get("owner_seen", 0), ENABLED.stat().st_mtime)  # an owner that never stopped counts from when the file was written
+    if owner in ("", "claim") or (owner != sid and now - seen > OWNER_STALE_S):
         ENABLED.write_text(sid, encoding="utf-8")
         owner = sid
     if owner != sid:
         return
-    s = load_state()
+    s["owner_seen"] = now
     snap = snapshot(s)
     if snap is None:
         save_state(s)
@@ -283,6 +294,19 @@ def selftest():
     assert PHRO.endswith("bin/phro.py") and Path(shlex.split(PHRO)[1]).is_file() and Path(shlex.split(FOREMAN)[1]).is_file()
     assert run_hook("b") == ""  # other session is not blocked
     assert run_hook("a") != "" and run_hook("a") == ""  # third identical block is let through (MAX_SAME_BLOCK=3)
+    assert run_hook("") == "" and ENABLED.read_text(encoding="utf-8") == "a"  # no session id: never owns, never blocks
+    old = time.time() - OWNER_STALE_S - 1
+    s = load_state(); s["owner_seen"] = old; save_state(s); os.utime(ENABLED, (old, old))
+    run_hook("b")
+    assert ENABLED.read_text(encoding="utf-8") == "b"  # the owner went quiet: the next session takes over
+    ENABLED.write_text("", encoding="utf-8"); save_state({"seen": []})
+    assert '"decision": "block"' in run_hook("c") and ENABLED.read_text(encoding="utf-8") == "c"  # an empty ENABLED is a claim
+    ENABLED.write_text("z", encoding="utf-8"); save_state({"seen": []})
+    assert run_hook("y") == "" and ENABLED.read_text(encoding="utf-8") == "z"  # a fresh owner with no Stop yet keeps the file
+    ENABLED.write_bytes("claim".encode("utf-16")); save_state({"seen": []})
+    assert '"decision": "block"' in run_hook("u") and ENABLED.read_text(encoding="utf-8") == "u"  # UTF-16 from PowerShell 5.1
+    sys.stdin = io.StringIO("[]")
+    assert hook() is None
     n_ssh = []  # negative cache: a down server is asked once per CACHE_S, not on every Stop
     phro.snapshot = lambda p: n_ssh.append(1)
     s = {}

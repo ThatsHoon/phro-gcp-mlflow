@@ -11,10 +11,10 @@ Only values some script reads are in it. Validate with `phro.py check-pack`.
 | `stages[]` | `name`, `experiment` (MLflow experiment), `depends_on` (stage names; defines `cascade`) |
 | `metrics[]` | `key` (`<set>/<name>`), `stage`, `dir`, `target`, `resample_unit`, `agg`, `gate.min_delta` |
 | `metrics[].agg` | `{"type": "mean", "field": F}` mean of unit values; `{"type": "f1", "tp", "fp", "fn"}` sums unit counts, then micro F1 (not the mean of unit F1s) |
-| `eval_sets` | `select`, `heldout`, `final`, `look_budget` ({set: max runs that look at it}) |
+| `eval_sets` | `select` (required; `decide` and `compare` default to it), `heldout`, `final`, `look_budget` ({set: max run families with metrics on it, per data version}) |
 | `server` | `host`, `allow_hosts`, `root`, `mlflow_port`, `gpus`, `venv`; optional `manifest` (default `<root>/runs.json`), `queue` (default `<root>/gpu_queue.txt`), `read_only` (default false), `done_globs` (default `["runs/**/DONE"]`), `run_name_rules` (default `[["(?:.*/)?([^/]+)/DONE$", "\\1"]]` (JSON escape); empty replacement = script end marker) |
 | `egress` | `forbidden_terms` (never in searches, URLs or subagent prompts), `note` |
-| `stats` | `seeds_min` (default 4), `bootstrap` (default 1000) |
+| `stats` | `seeds_min` (default 4, at least 2): seed pairs a decision needs; `bootstrap` (default 1000, at least 100): unit resamples; `min_units` (default 30): common units a decision needs |
 | `tag_alias`, `derived_params` | contract tag name -> project tag name; result-like params that `diff` ignores. Defaults `{}` and `[]` |
 The data version is a run tag (`data_version`), not a pack key.
 
@@ -23,11 +23,14 @@ The data version is a run tag (`data_version`), not a pack key.
 |---|---|
 | experiment | `stages[].experiment` |
 | run name | unique, equal to the result folder name; seeds end in `_s<N>` |
-| tags | `status` (running/done/smoke/frozen/aborted), `stage`, `sweep` (comma list), `variation`, `compare`, `axis`, `fixed`, `pick`, `hypothesis`, `idea`, `insight`, `review`, `intro`, `result`, `data_version`, `budget` (short/full), `accepted` (yes), `gate_<set>`, `reopen_if` (when frozen) |
+| tags | `status` (running/done/smoke/frozen/aborted), `stage`, `sweep` (comma list), `variation`, `compare`, `axis`, `fixed`, `pick`, `hypothesis`, `idea`, `insight`, `review`, `intro`, `result`, `data_version`, `budget` (short/full; no tag = full), `accepted` (yes, after a `decide` accept), `gate_<set>` (per-metric verdict from `decide`), `reopen_if` (when frozen) |
 | metrics | `<eval set>/<name>`; compare only identical keys. A run that records its own CI uses `<set>/ci_lo_<name>`, `<set>/ci_hi_<name>` |
-| artifact `units.jsonl` | one line per unit: `{"set", "unit", <fields the agg reads>}`; `ci` computes CIs and paired deltas from it |
+| artifact `units.jsonl` | one line per unit: `{"set", "unit", <fields the agg reads>}`; unit ids (string or number) unique per set, agg fields finite numbers. `ci`, `decide` and `splitcheck` read it; a bad line stops them (the message gives counts, never ids) |
 | leave-one-out | sweep name `loo_<...>` |
 | finished | a `DONE` file in the result folder. Never `pgrep` |
+
+## Decision log (`.phro/ledger/decisions.jsonl`, written by `decide`)
+One JSON object per line: `t`, `stage`, `set`, `base`, `arm` (families), `kind` (`change` or `loo`), `data_version` (of the arm runs), `budget` (`short` if any arm run has `budget=short`), `limit`, `idea`, `note`, `reverifies` (the short family a full-budget rerun re-verifies), `loo_of` (the change a leave-one-out tests), `k` (pairs), `n` (units), `metrics` ({key: `mean`, `lo`, `hi`, `verdict`, `why`}), `verdict` (`accept`, `accept-short`, `reject`, `undecided`). Append only; `audit` and `loo` read it. A later `change` decision on the same arm (more seeds) replaces its verdict. `decide` pairs only finished runs (`status=done`). It holds no unit ids or data rows.
 
 ## Standard result folder (read by `phro_sync.py`)
 `run.json` (`name`, `stage`, `params`, `tags`), `metrics.jsonl` (`{"step", "set", "key", "value"}`; the last value uses `"step": "final"`), `units.jsonl`, `DONE` (written last). Manifest entries (`phro.py manifest set NAME key=value`) become tags at sync, so `intro`, `result`, `insight`, `review` can be written before or after the run.

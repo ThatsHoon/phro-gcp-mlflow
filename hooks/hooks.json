@@ -2,11 +2,11 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|WebSearch|WebFetch",
+        "matcher": "Bash|PowerShell|Monitor|WebSearch|WebFetch",
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'python3 -c 1 >/dev/null 2>&1 && exec python3 -X utf8 \"$0\" \"$@\" || exec python -X utf8 \"$0\" \"$@\"' \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.py\"",
+            "command": "P=python; [ \"$OS\" != Windows_NT ] && command -v python3 >/dev/null 2>&1 && P=python3; exec \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.py\"",
             "timeout": 10
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'python3 -c 1 >/dev/null 2>&1 && exec python3 -X utf8 \"$0\" \"$@\" || exec python -X utf8 \"$0\" \"$@\"' \"${CLAUDE_PLUGIN_ROOT}/foreman/foreman.py\" hook",
+            "command": "P=python; [ \"$OS\" != Windows_NT ] && command -v python3 >/dev/null 2>&1 && P=python3; exec \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/foreman/foreman.py\" hook",
             "timeout": 60
           }
         ]

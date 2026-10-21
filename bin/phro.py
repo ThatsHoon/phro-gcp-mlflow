@@ -2,17 +2,16 @@
 """phro: PC-side CLI and library for AutoML loops on one GCP GPU VM with MLflow."""
 import copy
 import json
+import math
 import os
 import random
 import re
 import shlex
+import statistics
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from pathlib import Path
+from pathlib import Path  # urllib is imported where it is used: the guard hook imports this module on every Bash call
 
 ROOT = Path(__file__).resolve().parents[1]
 PARITY_CALLS = [{f"c{i}": (i % 3, i % 2, (i + 1) % 2) for i in range(40)},
@@ -20,8 +19,13 @@ PARITY_CALLS = [{f"c{i}": (i % 3, i % 2, (i + 1) % 2) for i in range(40)},
 REQUIRED = ["name", "goal", "stages", "metrics", "eval_sets", "server", "egress"]
 
 
+def _real(v):
+    """None for an empty value or an unexpanded ${...} placeholder (an MCP env the host left as text)."""
+    return None if not v or str(v).startswith("${") else v
+
+
 def find_pack(start=None):
-    d = Path(start or os.environ.get("CLAUDE_PROJECT_DIR") or Path.cwd()).resolve()
+    d = Path(_real(start) or _real(os.environ.get("CLAUDE_PROJECT_DIR")) or Path.cwd()).resolve()
     for q in [d, *d.parents]:
         f = q / ".phro" / "project.json"
         if f.is_file():
@@ -39,6 +43,7 @@ def load_pack_dict(d):
     p.setdefault("stats", {})
     p["stats"].setdefault("seeds_min", 4)
     p["stats"].setdefault("bootstrap", 1000)
+    p["stats"].setdefault("min_units", 30)
     p.setdefault("derived_params", [])
     p.setdefault("tag_alias", {})
     s = p.setdefault("server", {})
@@ -117,6 +122,12 @@ def check_pack(p):
             errs += [f"metric {k}: agg.{f} missing" for f in need if f not in a]
     if "stats" in p and not isinstance(p["stats"], dict):
         errs.append("stats: must be an object")
+    st = p.get("stats") if isinstance(p.get("stats"), dict) else {}
+    for k, lo in (("seeds_min", 2), ("bootstrap", 100), ("min_units", 1)):
+        if k in st and not (isinstance(st[k], int) and not isinstance(st[k], bool) and st[k] >= lo):
+            errs.append(f"stats.{k} must be an integer >= {lo}")
+    if isinstance(p.get("eval_sets"), dict) and not (isinstance(p["eval_sets"].get("select"), str) and p["eval_sets"]["select"]):
+        errs.append("eval_sets.select must name the selection set")
     s = p.get("server") if isinstance(p.get("server"), dict) else {}
     if not s.get("host"):
         errs.append("server.host missing")
@@ -267,20 +278,22 @@ class Unreachable(Exception):
         self.code = code  # HTTP status when MLflow answered, None when the connection failed
 
 
-_open = urllib.request.urlopen
+_open = None  # None = urllib.request.urlopen; tests swap it with _set_open
 
 
 def _set_open(fn):
     global _open
-    _open = fn or urllib.request.urlopen
+    _open = fn
 
 
 def _call(p, path, data=None):
+    import urllib.error
+    import urllib.request
     port = p["server"]["mlflow_port"]
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data,
                                  headers={"Content-Type": "application/json"} if data else {})
     try:
-        with _open(req, timeout=30) as r:
+        with (_open or urllib.request.urlopen)(req, timeout=30) as r:
             return r.read()
     except urllib.error.HTTPError as e:
         raise Unreachable(f"MLflow answered HTTP {e.code} for {path}", e.code)
@@ -325,6 +338,7 @@ def fetch_runs(p):
 
 
 def history(p, run_id, key):
+    import urllib.parse
     q = urllib.parse.urlencode({"run_id": run_id, "metric_key": key})
     return [(int(m.get("step", 0)), float(m["value"]))
             for m in rest(p, "/api/2.0/mlflow/metrics/get-history?" + q).get("metrics", [])]
@@ -414,7 +428,7 @@ def cmd_report(p, a):
 
 
 def cmd_compare(p, a):
-    sweep, set_ = _opt(a, "--sweep"), _opt(a, "--set") or p["eval_sets"].get("heldout", "test")
+    sweep, set_ = _opt(a, "--sweep"), _opt(a, "--set") or p["eval_sets"]["select"]  # heldout is a look; ask for it with --set
     names = [x for i, x in enumerate(a) if not x.startswith("--") and (i == 0 or a[i - 1] not in ("--set", "--sweep"))]
     pick = [r for r in fetch_runs(p) if r["name"] in names or (sweep and sweep in tag(r, "sweep", p).split(","))]
     if sweep:
@@ -612,22 +626,45 @@ def cmd_queue(p, a):
     return 1
 
 
-def load_units(p, run, set_, units_dir):
-    """{unit: row} of one run on one set, from <units_dir>/<name>.jsonl or the run's units.jsonl artifact; None if absent."""
+class UnitsError(Exception):
+    """A units.jsonl that cannot be trusted (bad line, missing unit, duplicate unit ids)."""
+
+
+def load_units(p, run, set_, units_dir, agg=None):
+    """{unit: row} of one run on one set, from <units_dir>/<name>.jsonl or the run's units.jsonl artifact; None if absent.
+    With agg, every row on the set must hold finite numbers in the fields agg reads."""
     if units_dir:
         f = Path(units_dir) / (run["name"] + ".jsonl")
-        text = f.read_text(encoding="utf-8") if f.is_file() else None
+        text = f.read_text(encoding="utf-8", errors="replace") if f.is_file() else None
     else:
+        import urllib.parse
         try:
-            text = get_bytes(p, "/get-artifact?" + urllib.parse.urlencode({"path": "units.jsonl", "run_uuid": run["id"]})).decode("utf-8")
+            text = get_bytes(p, "/get-artifact?" + urllib.parse.urlencode({"path": "units.jsonl", "run_uuid": run["id"]})).decode("utf-8", "replace")
         except Unreachable as e:
             if e.code is None:
                 raise
             text = None
     if text is None:
         return None
-    rows = [json.loads(l) for l in text.splitlines() if l.strip()]
-    return {r["unit"]: r for r in rows if r.get("set") == set_}
+    fields = [] if agg is None else [agg["field"]] if agg["type"] == "mean" else [agg["tp"], agg["fp"], agg["fn"]]
+    out, dup, bad = {}, 0, 0
+    for i, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            raise UnitsError(f"{run['name']}: units.jsonl line {i} is not JSON")
+        if not isinstance(r, dict) or not isinstance(r.get("unit"), (str, int, float)):
+            raise UnitsError(f"{run['name']}: units.jsonl line {i} has no unit id (string or number)")
+        if r.get("set") == set_:
+            dup += r["unit"] in out
+            bad += not all(isinstance(r.get(k), (int, float)) and math.isfinite(r[k]) for k in fields)
+            out[r["unit"]] = r
+    if dup or bad:  # counts only: unit ids can be private
+        raise UnitsError(f"{run['name']}: units.jsonl on set {set_}: {dup} duplicate unit ids, "
+                         f"{bad} rows without finite numbers in {', '.join(fields) or '-'}")
+    return out
 
 
 def gate_verdict(lo, hi, min_delta, dir_):
@@ -637,20 +674,130 @@ def gate_verdict(lo, hi, min_delta, dir_):
     return "통과" if lo > min_delta else "미달" if hi < min_delta else "보류"
 
 
+T975 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160, 2.145, 2.131,
+        2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042]
+
+
+def t975(df):
+    return T975[min(df, 30) - 1]  # ponytail: df > 30 reuses df=30 (slightly wide); add rows if packs ever run 30+ seeds
+
+
+def _num(rows, agg):
+    if agg["type"] == "mean":
+        return [(float(r[agg["field"]]),) for r in rows]
+    return [(float(r[agg["tp"]]), float(r[agg["fp"]]), float(r[agg["fn"]])) for r in rows]
+
+
+def _agg_num(num, idx, agg):
+    if agg["type"] == "mean":
+        return sum(num[j][0] for j in idx) / len(idx)
+    tp, fp, fn = (sum(num[j][c] for j in idx) for c in range(3))
+    d = 2 * tp + fp + fn
+    return 2 * tp / d if d else 0.0
+
+
+def paired_seeds(base, arm, agg, B=1000, seed=0):
+    """Same-seed pairs: base[i] and arm[i] are {unit: row} of seed i. Delta of the seed mean with a t interval:
+    mean +- t(K-1) * sqrt(s2/K + v_units), s2 = variance of the per-seed deltas (seed noise),
+    v_units = variance of the mean delta when units are resampled (all pairs see the same resample)."""
+    k = len(base)
+    ids = sorted(set.intersection(*(set(u) for u in base + arm))) if k else []
+    res = {"k": k, "n": len(ids), "base": [], "arm": [], "deltas": [], "mean": None, "lo": None, "hi": None}
+    if not ids:
+        return res
+    nb, na = [_num([u[x] for x in ids], agg) for u in base], [_num([u[x] for x in ids], agg) for u in arm]
+    allx = range(len(ids))
+    res["base"], res["arm"] = [_agg_num(x, allx, agg) for x in nb], [_agg_num(x, allx, agg) for x in na]
+    res["deltas"] = [a - b for a, b in zip(res["arm"], res["base"])]
+    res["mean"] = sum(res["deltas"]) / k
+    if k < 2:
+        return res
+    rng, n, means = random.Random(seed), len(ids), []
+    for _ in range(B):
+        smp = [rng.randrange(n) for _ in range(n)]
+        means.append(sum(_agg_num(na[i], smp, agg) - _agg_num(nb[i], smp, agg) for i in range(k)) / k)
+    h = t975(k - 1) * math.sqrt(statistics.variance(res["deltas"]) / k + statistics.variance(means))
+    res["lo"], res["hi"] = res["mean"] - h, res["mean"] + h
+    return res
+
+
+def done_runs(p):
+    """Finished runs only: an aborted or smoke seed never enters a decision."""
+    return [r for r in fetch_runs(p) if tag(r, "status", p) == "done"]
+
+
+def seed_runs(runs, fam):
+    """{seed: run} for runs named <fam>_s<seed>; duplicate names (against the contract) resolve to the newest run."""
+    out = {}
+    for r in runs:
+        m = re.fullmatch(re.escape(fam) + r"_s(\d+)", r["name"])
+        if m and r["start"] >= out.get(int(m.group(1)), {"start": -1})["start"]:
+            out[int(m.group(1))] = r
+    return out
+
+
+def pair_check(p, runs, base, arm, m, units_dir):
+    """paired_seeds for one metric plus its gate; a str is an error message."""
+    B, A = seed_runs(runs, base), seed_runs(runs, arm)
+    seeds = sorted(set(B) & set(A))
+    if not seeds:
+        return f"no same-seed pairs: need finished runs (status=done) named {base}_s<N> and {arm}_s<N> with the same N"
+    set_, bu, au = m["key"].split("/")[0], [], []
+    for s in seeds:
+        for runs_, out in ((B, bu), (A, au)):
+            u = load_units(p, runs_[s], set_, units_dir, m["agg"])
+            if u is None:
+                return f"{runs_[s]['name']}: no units.jsonl"
+            out.append(u)
+    st = p["stats"]
+    r = paired_seeds(bu, au, m["agg"], st["bootstrap"])
+    md = (m.get("gate") or {}).get("min_delta", 0.0)
+    why = ("no common units" if not r["n"] else f"{r['k']} pairs < seeds_min {st['seeds_min']}" if r["k"] < st["seeds_min"]
+           else f"{r['n']} units < min_units {st['min_units']}" if r["n"] < st["min_units"] else "")
+    r.update(seeds=seeds, min_delta=md, why=why, verdict="보류" if why else gate_verdict(r["lo"], r["hi"], md, m["dir"]))
+    return r
+
+
+def _f(x, sign=False):
+    return "-" if x is None else f"{x:+.4f}" if sign else f"{x:.4f}"
+
+
+def print_pairs(m, base, arm, r, B):
+    print(f"{m['key']} by seed pair: {base} vs {arm}, {r['k']} pairs, {r['n']} units, {B} unit resamples")
+    table(["seed", base, arm, "delta"], [[s, _f(b), _f(a), _f(d, True)] for s, b, a, d in zip(r["seeds"], r["base"], r["arm"], r["deltas"])])
+    print(f"mean delta {_f(r['mean'], True)}, 95% CI [{_f(r['lo'], True)}, {_f(r['hi'], True)}] (t, df={r['k'] - 1}; seed + unit variance); "
+          f"gate vs min_delta {r['min_delta']} ({m['dir']}): {r['verdict']}" + (f" ({r['why']})" if r["why"] else ""))
+
+
+def _names(a, valued):
+    return [x for i, x in enumerate(a) if not x.startswith("--") and (i == 0 or a[i - 1] not in valued)]
+
+
 def cmd_ci(p, a):
     key, ud = _opt(a, "--metric"), _opt(a, "--units")
     m = next((x for x in p["metrics"] if x["key"] == key), None)
     if m is None:
-        print(f"unknown metric: {key}")
+        print(f"unknown metric: {key} (usage: ci A B ... --metric KEY [--units DIR] | ci BASE ARM --metric KEY --pairs)")
         return 1
-    names = [x for i, x in enumerate(a) if not x.startswith("--") and (i == 0 or a[i - 1] not in ("--metric", "--units"))]
+    names = _names(a, ("--metric", "--units"))
+    if "--pairs" in a:
+        if len(names) != 2:
+            print("usage: ci BASE ARM --metric KEY --pairs [--units DIR]  (BASE, ARM = run families; runs are <family>_s<N>)")
+            return 1
+        r = pair_check(p, done_runs(p), names[0], names[1], m, ud)
+        if isinstance(r, str):
+            print(r)
+            return 1
+        print_pairs(m, names[0], names[1], r, p["stats"]["bootstrap"])
+        print(f"to decide and log it over every metric of the stage on the select set: decide {names[0]} {names[1]}")
+        return 0
     by = {r["name"]: r for r in fetch_runs(p)}
     if not names or any(n not in by for n in names):
         print("run not found: " + ", ".join(n for n in names if n not in by))
         return 1
     units = []
     for n in names:
-        u = load_units(p, by[n], key.split("/")[0], ud)
+        u = load_units(p, by[n], key.split("/")[0], ud, m["agg"])
         if u is None:
             print(f"{n}: no units.jsonl")
             return 1
@@ -660,14 +807,158 @@ def cmd_ci(p, a):
     if not b["n"]:
         print("no common units")
         return 1
-    md = (m.get("gate") or {}).get("min_delta", 0.0)
-    print(f"{key}, {b['n']} units, {B} paired resamples; delta = run - {names[0]}; gate: delta CI vs min_delta {md} ({m['dir']})")
-    table(["run", key, "95% CI", f"delta vs {names[0]}", "delta 95% CI", "gate"],
-          [[n, f"{v:.4f}", f"[{lo:.4f}, {hi:.4f}]", f"{v - b['value'][0]:+.4f}", f"[{dl:+.4f}, {dh:+.4f}]",
-            "-" if i == 0 else gate_verdict(dl, dh, md, m["dir"])]
-           for i, (n, v, (lo, hi), (dl, dh)) in enumerate(zip(names, b["value"], b["ci"], b["d_ci"]))])
-    print(f"record it with: manifest set <run> gate_{key.split('/')[0]}=<verdict>")
+    print(f"{key}, {b['n']} units, {B} paired resamples; delta = run - {names[0]}")
+    table(["run", key, "95% CI", f"delta vs {names[0]}", "delta 95% CI"],
+          [[n, f"{v:.4f}", f"[{lo:.4f}, {hi:.4f}]", f"{v - b['value'][0]:+.4f}", f"[{dl:+.4f}, {dh:+.4f}]"]
+           for n, v, (lo, hi), (dl, dh) in zip(names, b["value"], b["ci"], b["d_ci"])])
+    print("single runs: these CIs cover unit sampling only, not seed noise. Decide with `ci BASE ARM --pairs` or `decide BASE ARM`.")
     return 0
+
+
+def stage_of(p, exp):
+    c = [s for s in p["stages"] if exp.startswith(s["experiment"])]
+    return max(c, key=lambda s: len(s["experiment"]))["name"] if c else None
+
+
+def decisions_path(p):
+    return Path(p["_dir"]) / "ledger" / "decisions.jsonl" if p.get("_dir") else None
+
+
+def read_decisions(p):
+    f = decisions_path(p)
+    if not (f and f.is_file()):
+        return []
+    out = []
+    for line in f.read_text(encoding="utf-8").splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            out.append(d)
+    return out
+
+
+def latest_changes(decs, stage=None, dv=None):
+    """{arm: (log index of its first change decision, its latest change decision)} (on stage and data_version when given).
+    A later decision on the same arm (more seeds) replaces the earlier verdict but keeps the arm's place in the stack."""
+    out = {}
+    for i, d in enumerate(decs):
+        if d.get("kind") == "change" and (stage is None or (d.get("stage") == stage and d.get("data_version") == dv)):
+            out[d.get("arm")] = (out.get(d.get("arm"), (i,))[0], d)
+    return out
+
+
+def accepted(decs, stage, dv):
+    """[(first log index, decision)] of the arms whose latest change decision on (stage, data_version) is accept, in stack order."""
+    return sorted((x for x in latest_changes(decs, stage, dv).values() if x[1].get("verdict") == "accept"), key=lambda x: x[0])
+
+
+def loo_pending(decs, stage, dv):
+    """Accepted changes on (stage, data_version) that no leave-one-out decision (decide ... --loo ARM) has tested."""
+    return [d for i, d in accepted(decs, stage, dv) if not any(e.get("kind") == "loo" and e.get("loo_of") == d.get("arm") for e in decs[i + 1:])]
+
+
+def cmd_decide(p, a):
+    valued = ("--set", "--units", "--limit", "--idea", "--note", "--reverify", "--loo")
+    names = _names(a, valued)
+    if len(names) != 2 or any((_opt(a, f) or "--").startswith("--") for f in valued if f in a) or ("--loo" in a and "--reverify" in a):
+        print("usage: decide BASE ARM [--set S] [--units DIR] [--limit L-ID] [--idea IDEA-ID] [--note TEXT]"
+              " [--reverify SHORT-ARM | --loo CHANGE-ARM]")
+        return 1
+    base, arm = names
+    set_, ud = _opt(a, "--set") or p["eval_sets"]["select"], _opt(a, "--units")
+    runs = done_runs(p)
+    A = seed_runs(runs, arm)
+    if not A:
+        print(f"no finished runs (status=done) named {arm}_s<N>")
+        return 1
+    stage = stage_of(p, A[min(A)]["exp"])
+    ms = [m for m in p["metrics"] if m["stage"] == stage and m["key"].startswith(set_ + "/")]
+    if not ms:
+        print(f"no {set_}/ metric declared for stage {stage}: add one to project.json metrics")
+        return 1
+    res = {}
+    for m in ms:
+        r = pair_check(p, runs, base, arm, m, ud)
+        if isinstance(r, str):
+            print(r)
+            return 1
+        print_pairs(m, base, arm, r, p["stats"]["bootstrap"])
+        res[m["key"]] = r
+    vs = [r["verdict"] for r in res.values()]
+    verdict = "reject" if "미달" in vs else "accept" if all(v == "통과" for v in vs) else "undecided"
+    short = any(tag(r, "budget", p) == "short" for r in A.values())
+    if verdict == "accept" and short:
+        verdict = "accept-short"
+    loo = _opt(a, "--loo")
+    rec = {"t": time.strftime("%Y-%m-%d %H:%M:%S"), "stage": stage, "set": set_, "base": base, "arm": arm,
+           "kind": "loo" if loo else "change", "data_version": ",".join(sorted({tag(r, "data_version", p) for r in A.values()} - {""})),
+           "budget": "short" if short else "full", "limit": _opt(a, "--limit") or "", "idea": _opt(a, "--idea") or "",
+           "note": _opt(a, "--note") or "", "reverifies": _opt(a, "--reverify") or "", "loo_of": loo or "",
+           "k": min(r["k"] for r in res.values()), "n": min(r["n"] for r in res.values()),
+           "metrics": {k: {f: r[f] for f in ("mean", "lo", "hi", "verdict", "why")} for k, r in res.items()}, "verdict": verdict}
+    f = decisions_path(p)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    with open(f, "a", encoding="utf-8") as h:
+        h.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    meaning = {"accept": f"keep the change of {loo}" if loo else f"adopt {arm}" + (" (read_only pack: record it in the ledger only)" if p["server"]["read_only"]
+                                                                                  else f": manifest set {arm}_s<N> accepted=yes for each seed run"),
+               "accept-short": f"short-budget pass only: rerun {arm} at budget=full as a new family, then decide {base} <new family> --reverify {arm}",
+               "reject": f"the stack is worse with the change of {loo}: drop it" if loo else f"do not adopt {arm}",
+               "undecided": f"no contribution of {loo} shown: more seeds, or drop it for the simpler stack" if loo
+               else "not decided: more seeds, or more units, then decide again"}[verdict]
+    print(f"\ndecision: {verdict} -> {meaning}\nlogged: {f}")
+    return 0
+
+
+def cmd_loo(p, a):
+    st, v = _opt(a, "--stage"), _opt(a, "--data")
+    if not st or v is None:
+        print("usage: loo --stage STAGE --data VERSION")
+        return 1
+    decs = read_decisions(p)
+    pend = loo_pending(decs, st, v)
+    if not pend:
+        print(f"stage {st}, data_version {v}: no accepted change waits for leave-one-out")
+        return 0
+    head = accepted(decs, st, v)[-1][1]["arm"]
+    print(f"stage {st}, data_version {v}: {len(pend)} accepted changes not yet tested by leave-one-out; current stack = {head}")
+    for d in pend:
+        print(f"- arm: {head} without the change of {d['arm']} (idea {d.get('idea') or '-'}, limit {d.get('limit') or '-'}); "
+              f"seeds_min seeds, then: decide <that arm> {head} --loo {d['arm']}")
+    print("plan these arms through plan.md and the user's approval; nothing is queued by this command")
+    return 0
+
+
+def cmd_splitcheck(p, a):
+    names, ud = _names(a, ("--units",)), _opt(a, "--units")
+    if len(names) != 1:
+        print("usage: splitcheck RUN [--units DIR]  (unit ids must not repeat across the select, heldout and final sets)")
+        return 1
+    run = {"name": names[0], "id": ""} if ud else next((r for r in fetch_runs(p) if r["name"] == names[0]), None)
+    if run is None:
+        print(f"run not found: {names[0]}")
+        return 1
+    sets = [p["eval_sets"][k] for k in ("select", "heldout", "final") if isinstance(p["eval_sets"].get(k), str)]
+    U = {s: load_units(p, run, s, ud) for s in sets}
+    if all(u is None for u in U.values()):
+        print(f"{names[0]}: no units.jsonl")
+        return 1
+    have, missing = [s for s in sets if U[s]], [s for s in sets if not U[s]]
+    if len(have) < 2:
+        print(f"nothing to compare: {names[0]} has units on {', '.join(have) or 'no eval set'}; use a run evaluated on two or more sets")
+        return 1
+    rows, bad = [], 0
+    for i, s1 in enumerate(have):
+        for s2 in have[i + 1:]:
+            n = len(set(U[s1]) & set(U[s2]))
+            bad += n
+            rows.append([f"{s1} x {s2}", len(U[s1]), len(U[s2]), n])
+    table(["sets", "units A", "units B", "shared unit ids"], rows)
+    print(("split ok" if not bad else "split leak: the same unit ids sit in two eval sets")
+          + (f" (no units on {', '.join(missing)}: not checked)" if missing else ""))
+    return 1 if bad else 0
 
 
 def baseline_tables(p, runs, version):
@@ -719,14 +1010,21 @@ def audit_issues(p, runs, manifest, snap):
             out += [f"GPU idle: gpu {i} util {u}% mem {m} MiB while waiting: {' '.join(snap['waiting'])}"
                     for i, u, m in snap.get("gpus", []) if u < 5 and m < 500]
     for s_, budget in p["eval_sets"].get("look_budget", {}).items():
-        n = sum(any(k.startswith(s_ + "/") for k in r["metrics"]) for r in runs)
-        if n > budget:
-            out.append(f"look_budget exceeded on {s_}: {n} runs > {budget}")
-    for v in sorted({tag(r, "data_version", p) for r in runs} - {""}):
-        mine = [r for r in runs if tag(r, "data_version", p) == v]
-        acc = sum(tag(r, "accepted", p) == "yes" for r in mine)
-        if acc >= 3 and not any(s_.startswith("loo_") for r in mine for s_ in tag(r, "sweep", p).split(",")):
-            out.append(f"data_version {v}: {acc} accepted runs and no leave-one-out sweep")
+        looks = {}  # a look = one run family (its seeds together) evaluated on the set, counted per data version
+        for r in runs:
+            if any(k.startswith(s_ + "/") for k in r["metrics"]):
+                looks.setdefault(tag(r, "data_version", p) or "-", set()).add(family(r["name"]))
+        out += [f"look_budget exceeded on {s_} (data_version {v}): {len(f_)} run families > {budget}"
+                for v, f_ in sorted(looks.items()) if len(f_) > budget]
+    decs = read_decisions(p)
+    for st, v in sorted({(d.get("stage"), d.get("data_version")) for d in decs}, key=str):
+        n = len(loo_pending(decs, st, v))
+        if n >= 3:
+            out.append(f"stage {st}, data_version {v}: {n} accepted changes not yet tested by leave-one-out (loo --stage {st} --data {v})")
+    for arm, (i, d) in latest_changes(decs).items():  # a full-budget recheck closes it whether it passed or failed
+        if d.get("verdict") == "accept-short" and not any(e.get("reverifies") == arm and e.get("verdict") in ("accept", "reject") for e in decs[i + 1:]):
+            out.append(f"{arm}: short-budget pass not re-verified at full budget "
+                       f"(rerun at budget=full as a new family, then decide BASE <family> --reverify {arm})")
     out += [f"frozen: {r['name']} reopen if: {tag(r, 'reopen_if', p)}" for r in runs
             if tag(r, "status", p) == "frozen" and tag(r, "reopen_if", p)]
     return out
@@ -850,10 +1148,12 @@ def selftest():
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         assert cmd_report(EX, ["--run", "r1_s0"]) == 0 and cmd_compare(EX, ["r1_s1", "r2", "--set", "heldout"]) == 0
+        assert cmd_compare(EX, ["r1_s1"]) == 0  # default set = eval_sets.select, never heldout
         assert cmd_diff({**EX, "derived_params": ["train"]}, ["r1_s0", "--vs", "r1_s1"]) == 0 and cmd_list(EX, ["--exp", "exp_one"]) == 0
         assert cmd_diff(EX, ["zz", "--vs", "r2"]) == 1
     o = out.getvalue()
     assert "compare on heldout" in o and "| r2 |" in o and "| lr | 1 | 2 |" in o and "| train |" not in o and "run not found: zz" in o
+    assert "| run | experiment | gate_dev |" in o
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:  # leakcheck sees a term that only lives in an old commit
         g = lambda *c: subprocess.run(["git", "-C", td, "-c", "user.name=t", "-c", "user.email=t@t", *c], capture_output=True, check=True)
         g("init", "-q"); (Path(td) / "a.txt").write_text("Secret-Host"); g("add", "a.txt"); g("commit", "-qm", "a")
@@ -891,10 +1191,7 @@ def selftest():
     assert [r["name"] for r in cascade_runs(dag, dag_runs, "a", "v2")] == ["r2"]
     iss = audit_issues(EX, base, {"r1_s0": {"intro": "x"}}, {"gpus": [[0, 0, 0]], "waiting": ["run_x.sh"], "done": {"runs/s/zz/DONE": 1}})
     assert any("기대" in i or "Expected" in i for i in iss) and any("not synced" in i and "zz" in i for i in iss) and any("idle" in i for i in iss)
-    three_accepted = [DONE(r, accepted="yes") for r in base]
-    assert any("leave-one-out" in i for i in audit_issues(EX, three_accepted, {}, None))
-    assert not any("leave-one-out" in i for i in audit_issues(EX, [DONE(r, accepted="yes", sweep="loo_a") for r in base], {}, None))
-    over = [{**r, "metrics": {"final/f1": 1.0}} for r in base]
+    over =[{**r, "metrics": {"final/f1": 1.0}} for r in base]
     assert any("look_budget" in i and "final" in i for i in audit_issues(EX, over, {}, None))
     frozen = [{**base[0], "tags": {"status": "frozen", "reopen_if": "later"}}]
     assert any("reopen if: later" in i for i in audit_issues(EX, frozen, {}, None))
@@ -918,9 +1215,15 @@ def selftest():
             assert cmd_ci(EX, ["r1_s0", "r2", "--metric", "heldout/f1", "--units", str(ud)]) == 1
             assert cmd_ci(EX, ["r1_s0", "--metric", "nope"]) == 1
         o = out.getvalue()
-        assert "heldout/f1, 12 units, 1000 paired resamples; delta = run - r1_s0" in o and "| run | heldout/f1 | 95% CI | delta vs r1_s0 | delta 95% CI | gate |" in o
-        assert "manifest set <run> gate_heldout=<verdict>" in o and " | - |" in o
+        assert "heldout/f1, 12 units, 1000 paired resamples; delta = run - r1_s0" in o and "| run | heldout/f1 | 95% CI | delta vs r1_s0 | delta 95% CI |" in o
+        assert "| gate |" not in o and "not seed noise" in o and "--pairs" in o  # single runs never print a verdict
         assert "r2: no units.jsonl" in o and "unknown metric: nope" in o
+        (ud / "r1_s0.jsonl").write_text("".join(json.dumps({"set": "heldout", "unit": "c1", "tp": 1, "fp": 0, "fn": 0}) + "\n" for _ in range(2)), encoding="utf-8")
+        try: load_units(EX, {"name": "r1_s0"}, "heldout", ud); assert False
+        except UnitsError as e: assert "1 duplicate unit ids" in str(e) and "c1" not in str(e)
+        (ud / "r1_s0.jsonl").write_text("{bad\n", encoding="utf-8")
+        try: load_units(EX, {"name": "r1_s0"}, "heldout", ud); assert False
+        except UnitsError as e: assert "line 1 is not JSON" in str(e)
     def http404(req, timeout=None): raise urllib.error.HTTPError(req.full_url, 404, "nf", {}, None)
     _set_open(http404)
     assert load_units(EX, {"name": "n", "id": "x"}, "heldout", None) is None
@@ -986,12 +1289,118 @@ def selftest():
     globals()["ssh"] = lambda q, c, *a, **k: subprocess.CompletedProcess([], 1, "", "")
     assert remote_manifest(EX) is None
     globals()["ssh"], globals()["scp"] = old_ssh, old_scp
+    # seed pairs, decision log, leave-one-out, budget, split check
+    assert _real("${CLAUDE_PROJECT_DIR}") is None and _real("") is None and _real("x") == "x"
+    assert t975(1) == 12.706 and t975(3) == 3.182 and t975(99) == 2.042
+    for bad_st, word in (({"seeds_min": 1}, "stats.seeds_min"), ({"bootstrap": 0}, "stats.bootstrap"), ({"min_units": 0}, "stats.min_units")):
+        assert any(word in e for e in check_pack(load_pack_dict({**EXRAW, "stats": {**EXRAW["stats"], **bad_st}}))), word
+    assert any("eval_sets.select" in e for e in check_pack(load_pack_dict({**EXRAW, "eval_sets": {"heldout": "heldout"}})))
+    MEAN = {"type": "mean", "field": "c"}
+
+    def draw(p_hit, seed, n=120):
+        g = random.Random(seed)
+        return {f"u{i}": {"set": "dev", "unit": f"u{i}", "c": 1.0 if g.random() < p_hit else 0.0} for i in range(n)}
+
+    better = paired_seeds([draw(0.5, s) for s in range(4)], [draw(0.75, 10 + s) for s in range(4)], MEAN, 300)
+    same = paired_seeds([draw(0.5, s) for s in range(4)], [draw(0.5, 10 + s) for s in range(4)], MEAN, 300)
+    assert better["k"] == 4 and better["n"] == 120 and gate_verdict(better["lo"], better["hi"], 0.0, "max") == "통과"
+    assert gate_verdict(same["lo"], same["hi"], 0.0, "max") == "보류" and same["lo"] < same["mean"] < same["hi"]
+    one = paired_seeds([draw(0.5, 0)], [draw(0.75, 1)], MEAN, 50)
+    assert one["k"] == 1 and one["mean"] is not None and one["lo"] is None
+    with tempfile.TemporaryDirectory() as td:
+        ud = Path(td) / "units"
+        ud.mkdir()
+        TP = load_pack_dict({**EXRAW, "stats": {"seeds_min": 4, "bootstrap": 200, "min_units": 50}})
+        TP["_dir"], TP["metrics"] = Path(td) / ".phro", [{"key": "dev/acc", "stage": "classify", "dir": "max", "agg": MEAN, "gate": {"min_delta": 0.0}}]
+        FR = []
+
+        def fam(name, p_hit, seed0, **t):
+            for s in range(4):
+                n = f"{name}_s{s}"
+                FR.append({"exp": "2_classify", "id": n, "name": n, "start": 0, "end": 1, "params": {}, "metrics": {},
+                           "tags": {"status": "done", "data_version": "v1", **t}})
+                (ud / (n + ".jsonl")).write_text("".join(json.dumps(r) + "\n" for r in draw(p_hit, seed0 + s).values()), encoding="utf-8")
+
+        fam("base", 0.5, 0); fam("arm", 0.75, 10); fam("arm2", 0.75, 20)
+        fam("shortarm", 0.75, 40, budget="short"); fam("shortarm_full", 0.75, 40, budget="full"); fam("same", 0.5, 50)
+        fam("short2", 0.75, 60, budget="short"); fam("short2_full", 0.25, 70); fam("abort", 0.75, 80)
+        FR[-1]["tags"]["status"] = "aborted"  # abort_s3: never paired
+        assert seed_runs([{"name": "f_s0", "start": 2, "id": "new"}, {"name": "f_s0", "start": 1, "id": "old"}], "f")[0]["id"] == "new"
+        assert set(seed_runs(FR, "shortarm")) == {0, 1, 2, 3}  # shortarm_full_s<N> is another family
+        old_fr, globals()["fetch_runs"] = globals()["fetch_runs"], lambda q: FR
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert cmd_ci(TP, ["base", "arm", "--metric", "dev/acc", "--pairs", "--units", str(ud)]) == 0
+            assert cmd_ci(TP, ["base", "--metric", "dev/acc", "--pairs"]) == 1
+            assert cmd_decide(TP, ["base", "arm", "--units", str(ud), "--idea", "IDEA-001", "--limit", "L-001"]) == 0
+            assert cmd_decide(TP, ["base", "same", "--units", str(ud)]) == 0
+            assert cmd_decide(TP, ["base", "shortarm", "--units", str(ud)]) == 0
+            assert cmd_decide(TP, ["base", "nope", "--units", str(ud)]) == 1
+            assert cmd_decide(TP, ["base", "arm", "--set", "heldout", "--units", str(ud)]) == 1  # no heldout/ metric declared
+        o = out.getvalue()
+        decs = read_decisions(TP)
+        assert [d["verdict"] for d in decs] == ["accept", "undecided", "accept-short"], [d["verdict"] for d in decs]
+        assert decs[0]["k"] == 4 and decs[0]["data_version"] == "v1" and decs[0]["idea"] == "IDEA-001" and decs[0]["limit"] == "L-001"
+        assert decs[0]["metrics"]["dev/acc"]["verdict"] == "통과" and decs[2]["budget"] == "short"
+        assert "dev/acc by seed pair: base vs arm, 4 pairs, 120 units" in o and "decision: accept -> adopt arm" in o
+        assert "no finished runs (status=done) named nope_s<N>" in o and "no heldout/ metric declared for stage classify" in o
+        iss = audit_issues(TP, FR, {}, None)
+        assert any("shortarm: short-budget pass not re-verified" in i for i in iss) and not any("leave-one-out" in i for i in iss)
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert cmd_decide(TP, ["base", "shortarm_full", "--units", str(ud), "--reverify", "shortarm"]) == 0
+            assert cmd_decide(TP, ["base", "arm2", "--units", str(ud)]) == 0
+            assert cmd_decide(TP, ["base", "arm", "--units", str(ud)]) == 0  # more seeds later: replaces the verdict, keeps the stack order
+            assert cmd_decide(TP, ["base", "short2", "--units", str(ud)]) == 0
+            assert any("short2: short-budget" in i for i in audit_issues(TP, FR, {}, None))
+            assert cmd_decide(TP, ["base", "short2_full", "--units", str(ud), "--reverify", "short2"]) == 0
+            assert cmd_decide(TP, ["base", "abort", "--units", str(ud)]) == 0
+        decs = read_decisions(TP)
+        rv = [d for d in decs if d["reverifies"]]
+        assert [d["verdict"] for d in rv] == ["accept", "reject"] and decs[-1]["k"] == 3 and decs[-1]["verdict"] == "undecided"
+        iss = audit_issues(TP, FR, {}, None)
+        assert not any("short-budget" in i for i in iss)  # a failed recheck closes it too
+        assert any("3 accepted changes not yet tested by leave-one-out" in i for i in iss)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert cmd_loo(TP, ["--stage", "classify", "--data", "v1"]) == 0
+            assert cmd_decide(TP, ["same", "arm2", "--units", str(ud), "--loo"]) == 1  # --loo names the change left out
+            assert cmd_decide(TP, ["same", "arm2", "--loo", "arm", "--reverify", "x"]) == 1
+            for ch in ("arm", "shortarm_full"):
+                assert cmd_decide(TP, ["same", "arm2", "--units", str(ud), "--loo", ch]) == 0
+            assert cmd_loo(TP, ["--stage", "classify", "--data", "v1"]) == 0
+            assert cmd_decide(TP, ["same", "arm2", "--units", str(ud), "--loo", "arm2"]) == 0
+            assert cmd_loo(TP, ["--stage", "classify", "--data", "v1"]) == 0 and cmd_loo(TP, []) == 1
+        o = out.getvalue()
+        assert "3 accepted changes not yet tested by leave-one-out; current stack = arm2" in o and "--loo shortarm_full" in o
+        assert "1 accepted changes not yet tested by leave-one-out; current stack = arm2" in o  # a partial leave-one-out leaves the rest
+        assert "no accepted change waits for leave-one-out" in o and "decision: accept -> keep the change of arm" in o
+        assert not any("leave-one-out" in i for i in audit_issues(TP, FR, {}, None))
+        globals()["fetch_runs"] = old_fr
+        sp = ud / "sp.jsonl"
+        sp.write_text("".join(json.dumps({"set": s, "unit": u, "c": 1}) + "\n" for s, u in (("dev", "a"), ("dev", "b"), ("heldout", "c"), ("final", "d"))), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as so:
+            assert cmd_splitcheck(TP, ["sp", "--units", str(ud)]) == 0
+            sp.write_text(sp.read_text(encoding="utf-8") + json.dumps({"set": "heldout", "unit": "a", "c": 1}) + "\n", encoding="utf-8")
+            assert cmd_splitcheck(TP, ["sp", "--units", str(ud)]) == 1
+            (ud / "one.jsonl").write_text(json.dumps({"set": "dev", "unit": "a", "c": 1}) + "\n", encoding="utf-8")
+            assert cmd_splitcheck(TP, ["one", "--units", str(ud)]) == 1 and cmd_splitcheck(TP, ["none", "--units", str(ud)]) == 1
+        o = so.getvalue()
+        assert "split ok" in o and "split leak" in o and "nothing to compare" in o and "none: no units.jsonl" in o
+        for rows, word in (([{"set": "dev", "unit": "a"}], "1 rows without finite numbers in c"), ([{"set": "dev", "unit": None, "c": 1}], "no unit id"),
+                           ([{"set": "dev", "unit": "a", "c": 1}] * 2, "1 duplicate unit ids"), ([{"set": "dev", "unit": ["a"], "c": 1}], "no unit id")):
+            (ud / "bad.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+            try:
+                load_units(TP, {"name": "bad"}, "dev", ud, MEAN)
+                raise AssertionError(word)
+            except UnitsError as e:
+                assert word in str(e), (word, str(e))
     print("phro selftest ok")
 
 
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
-        print("usage: phro.py selftest | check-pack | leakcheck [dir] [--no-history] | list | report | compare | diff | status | ci | baseline | cascade | audit | setup | manifest | queue")
+        print("usage: phro.py selftest | check-pack | leakcheck [dir] [--no-history] | list | report | compare | diff | status | ci | decide | loo"
+              " | splitcheck | baseline | cascade | audit | setup | manifest | queue")
         return 0
     cmd, a = argv[0], argv[1:]
     if cmd == "selftest":
@@ -1013,7 +1422,7 @@ def main(argv):
         return 1
     try:
         return fn(p, a)
-    except Unreachable as e:
+    except (Unreachable, UnitsError) as e:
         print(e)
         return 1
 

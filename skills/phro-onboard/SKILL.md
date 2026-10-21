@@ -28,7 +28,7 @@ Ask once, then pick. Only a rough workflow, or models not decided -> Mode 1 (it 
 For every stage produce, as files (section 4) and not as chat:
 - Probe plan in the order of phro-mlflow `references/probe.md`: data check, ceiling, information, loss split (needs an upstream stage), smoke. Name the read-only script for each; scripts print counts only.
 - Method-screening axes: one structural choice per axis, listed in `plan.md`. A numeric HPO space only after a method wins; mark it "after screening".
-- Metric and gate: key `<set>/<name>`, direction, target, `resample_unit`, `agg` (`mean` or `f1`), `gate.min_delta`. Every metric must be computable from per-unit values; every gate needs a CI rule (paired seeds, `stats`, rules in phro-mlflow `references/sweep.md`).
+- Metric and gate: key `<set>/<name>`, direction, target, `resample_unit`, `agg` (`mean` or `f1`), `gate.min_delta`. Every metric must be computable from per-unit values; every gate needs a CI rule (paired seeds, `stats`, rules in phro-mlflow `references/sweep.md`). Declare each gated metric twice: on the select set (`<select>/<name>`, which `phro.py decide` uses to accept or reject a change) and on the heldout set (finalists and the KPI). Set `stats.seeds_min` (seed pairs per decision) and `stats.min_units` (fewest eval units a decision may rest on).
 - Baseline table (data version x stage x variation x seed, chain cells included) in `domain.md`; numbers come later from `phro.py baseline`.
 - Eval discipline: `eval_sets` select, heldout, final and a `look_budget`. Ask which data backs each set; one set cannot be both select and final.
 

@@ -1,13 +1,9 @@
 {
   "mcpServers": {
     "phro-foreman": {
-      "command": "sh",
-      "args": [
-        "-c",
-        "python3 -c 1 >/dev/null 2>&1 && exec python3 -X utf8 \"$0\" \"$@\" || exec python -X utf8 \"$0\" \"$@\"",
-        "${CLAUDE_PLUGIN_ROOT}/foreman/foreman.py",
-        "serve"
-      ]
+      "command": "python",
+      "args": ["-X", "utf8", "${CLAUDE_PLUGIN_ROOT}/foreman/foreman.py", "serve"],
+      "env": { "CLAUDE_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}" }
     }
   }
 }

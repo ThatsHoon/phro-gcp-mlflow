@@ -1,6 +1,9 @@
 {
   "name": "phro-gcp-mlflow",
-  "version": "0.0.1",
   "description": "Generic AutoML loop on a GCP GPU VM with MLflow: turn a workflow into a domain pack, plan sweeps, run a foreman, record experiments, and search for breakthroughs.",
-  "author": { "name": "thatshoon" }
+  "author": { "name": "thatshoon" },
+  "homepage": "https://github.com/ThatsHoon/phro-gcp-mlflow",
+  "repository": "https://github.com/ThatsHoon/phro-gcp-mlflow",
+  "license": "MIT",
+  "keywords": ["mlflow", "automl", "gcp", "gpu", "experiment-tracking"]
 }

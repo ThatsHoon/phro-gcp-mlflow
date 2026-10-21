@@ -20,6 +20,7 @@ Read `.phro/domain.md`: the goal-chain table (stage, metric key, target, ceiling
 - `server.read_only: true` means the VM is read-only: no launch, queue entry, process stop, file write or `manifest set` on the server. Result, insight and review text then go to the user and the local `.phro/ledger/`, and GPU-filling is reported as a proposal only.
 - Launching training needs the user's OK, unless that exact item is already in `.phro/plan.md` (the user's approved queue). New methods, direction changes and deletions are always asked.
 - Eval discipline: select on `eval_sets.select`, judge on `heldout` within `look_budget`, `final` once. See `references/eval.md`.
+- Accept or reject a change only with `decide BASE ARM` (same-seed pairs, at least `stats.seeds_min`, on the select set). Never accept from a single run, a single-run `ci`, or a point estimate.
 - A finished run missing from MLflow is a sync bug: run `audit` and fix it before reporting.
 - Plain technical English in files this skill writes. No emoji, no em or en dashes, no AI-attribution lines in commits, docs, manifests or MLflow text.
 
@@ -29,12 +30,16 @@ Read `.phro/domain.md`: the goal-chain table (stage, metric key, target, ceiling
 | `status` | per GPU: running procs or FREE, mem, util; queue; waiting scripts |
 | `list [--exp E]` | exact run, status, sweep and gate names; map the user's words to names |
 | `report --run NAME` / `--since HOURS` | verdict lines, hypothesis, intro, result, compare-tag runs |
-| `compare A B ... [--set S]` / `--sweep S` | same-key side by side, gates; sweep axis, fixed, pick, hypothesis |
+| `compare A B ... [--set S]` / `--sweep S` | same-key side by side, gates; sweep axis, fixed, pick, hypothesis. Default set is `eval_sets.select`; `--set <heldout>` counts as a look |
 | `diff NEW --vs OLD` | effective parameter differences; beyond the declared axis = confound |
-| `ci A B ... --metric KEY [--units DIR]` | per-run 95% bootstrap CI, same-unit paired delta vs the first run (from `units.jsonl`), and a gate verdict (통과/미달/보류) per run; record it with `manifest set <run> gate_<set>=<verdict>` |
+| `ci A B ... --metric KEY [--units DIR]` | single runs: per-run 95% bootstrap CI over units and the same-unit delta vs the first run (from `units.jsonl`). Unit noise only, so never a verdict |
+| `ci BASE ARM --metric KEY --pairs [--units DIR]` | run families (`<family>_s<N>`): per-seed deltas, mean delta with a t interval over seed and unit variance, gate verdict (통과/미달/보류) |
+| `decide BASE ARM [--set S] [--limit L-ID] [--idea IDEA-ID] [--note T] [--reverify SHORT-ARM \| --loo CHANGE-ARM]` | the accept decision: `ci --pairs` on every metric of the arm's stage on the select set; prints accept, accept-short (arm ran `budget=short`), reject or undecided and appends it to `.phro/ledger/decisions.jsonl` (local, so it works on read_only packs). `--reverify` marks a full-budget rerun of a short pass; `--loo` marks a leave-one-out (BASE = the stack without that change, ARM = the stack) |
+| `loo --stage S --data V` | accepted changes not yet tested by leave-one-out, and the arm to build for each (stack minus that change) |
+| `splitcheck RUN [--units DIR]` | unit ids shared between the select, heldout and final sets of one run (must be 0) |
 | `baseline --data V` | per stage and metric: run families (seed suffix dropped), seeds, mean [min, max], gap to target |
 | `cascade --stage S --data V` | finished downstream runs not on data version V = retrain list |
-| `audit` | missing intro/result/review, finished but unsynced, GPU idle while scripts wait, look_budget exceeded, 3+ accepted without leave-one-out, frozen list |
+| `audit` | missing intro/result/review, finished but unsynced, GPU idle while scripts wait, look_budget exceeded (run families per data version), 3+ accepted changes not yet tested by leave-one-out, short-budget accepts not re-verified at full budget, frozen list |
 | `manifest get NAME` / `manifest set NAME key=value ...` | run manifest on the server (intro, result, insight, review, axis, ...) |
 | `queue add GPU SCRIPT` / `queue list` | append one job to the server GPU queue (launched by the queue cron only on a GPU with no compute process) / show it |
 | `check-pack`, `leakcheck [dir]`, `setup` | pack validation, public-repo leak scan, server install (onboarding) |
@@ -42,8 +47,8 @@ Read `.phro/domain.md`: the goal-chain table (stage, metric key, target, ceiling
 `manifest set`, `queue add` and `setup` refuse when `server.read_only` is true (see the read-only rule above). Tunnel down -> the CLI prints the `ssh -N -L` command; run it, then retry. Contract and file formats: `references/contract.md`.
 
 ## 4. Workflows
-- **Result question** -> `report --run` (or `--since 6`). Answer: chain line, table `run | stage | variation | set | metric (key) | CI | gate`, one line vs compare runs and vs the run's `intro` expectation (met or not), one line why (insight ID), one line next proposal (which free GPU, what). Gate `보류` = CI straddles the threshold: say "not decided", not "failed".
-- **Every finished run or sweep** -> diagnose (`references/diagnosis.md`), update the ledger (`references/insights.md`), then write the run's `result` and `insight` with `manifest set` (`references/sweep.md`). If it tested an idea, update that idea in `.phro/ledger/idea-bag.md`. Read the ledger before designing the next sweep.
+- **Result question** -> `report --run` (or `--since 6`). Answer: chain line, table `run | stage | variation | set | metric (key) | CI | gate`, one line vs compare runs and vs the run's `intro` expectation (met or not), one line why (insight ID), one line next proposal (which free GPU, what). The gate cell comes from `decide` or `ci --pairs` on the run's family; a family with fewer than `stats.seeds_min` seeds has no gate yet (write `-`, and how many seeds are missing). Gate `보류` = CI straddles the threshold: say "not decided", not "failed".
+- **Every finished run or sweep** -> diagnose (`references/diagnosis.md`), update the ledger (`references/insights.md`), then write the run's `result` and `insight` with `manifest set` (`references/sweep.md`). Once an arm family has `stats.seeds_min` seeds paired with its compare family, run `decide <compare family> <arm family> --limit <L-ID> --idea <IDEA-ID>`; only `accept` makes it the new compare run. If it tested an idea, update that idea in `.phro/ledger/idea-bag.md`. Read the ledger before designing the next sweep.
 - **Why / what is wrong** -> `references/diagnosis.md`, in its answer format; run read-only diagnostics, propose GPU ones.
 - **New experiment** -> stage section of `.phro/ledger/insights.md`, then `references/idea-bag.md` (ideas whose `targets` match the limit), then `references/probe.md` (input, labels, ceiling first), then `references/sweep.md` (define the sweep, write each run's `intro`), then `references/legacy-review.md` (independent review of inherited defaults), approval, launch, and `diff` vs the compare run. Check the `audit` frozen list so a dead end is not repeated.
 - **Tuning numbers** -> only after method screening picked a method (`references/sweep.md` "Two layers").
@@ -52,7 +57,7 @@ Read `.phro/domain.md`: the goal-chain table (stage, metric key, target, ceiling
 - **Upstream stage changed** -> `cascade --stage S --data V`, rerun its probes, retrain downstream in dependency order. Keep old versions' configs, evals and results; never overwrite them.
 - **Evaluation doubts** -> `references/eval.md`.
 - **Something failed or went idle** -> `references/lessons.md` (record; propose a rule when it repeats).
-- **Foreman** (MCP `foreman_check`, `foreman_report`; Stop hook active while `.phro/foreman/ENABLED` exists): when it blocks, judge each finished run against its `intro` expectation, fill idle GPUs from `.phro/plan.md`, then `foreman_report` (summary with metric keys and numbers, `next`, `blocked` when waiting on the user). Keep `plan.md` current.
+- **Foreman** (MCP `foreman_check`, `foreman_report`; Stop hook active while `.phro/foreman/ENABLED` exists; it blocks only the session id written in that file, an empty file or `claim` goes to the next session that stops, and an owner silent for 2 hours is taken over): when it blocks, judge each finished run against its `intro` expectation, fill idle GPUs from `.phro/plan.md`, then `foreman_report` (summary with metric keys and numbers, `next`, `blocked` when waiting on the user). Keep `plan.md` current.
 - **Changing this skill** -> `references/lessons.md` steps 3-4.
 
 ## 5. References

@@ -67,6 +67,9 @@ imozuru는 플러그인에 넣지 않는다. 설치된 imozuru 스킬을 호출�
     {"name": "classify", "experiment": "2_classify", "depends_on": ["embed"]}
   ],
   "metrics": [
+    {"key": "dev/f1", "stage": "classify", "dir": "max",
+     "resample_unit": "doc_id", "agg": {"type": "f1", "tp": "tp", "fp": "fp", "fn": "fn"},
+     "gate": {"min_delta": 0.0}},
     {"key": "heldout/f1", "stage": "classify", "dir": "max", "target": 0.9,
      "resample_unit": "doc_id", "agg": {"type": "f1", "tp": "tp", "fp": "fp", "fn": "fn"},
      "gate": {"min_delta": 0.0}}
@@ -75,11 +78,11 @@ imozuru는 플러그인에 넣지 않는다. 설치된 imozuru 스킬을 호출�
   "server": {"host": "my-gpu", "allow_hosts": ["my-gpu"], "root": "~/phro/proj",
              "mlflow_port": 5002, "gpus": 4, "venv": "~/phro/proj/venv"},
   "egress": {"forbidden_terms": ["..."], "note": "검색어·서브에이전트 프롬프트에 넣지 않을 것"},
-  "stats": {"seeds_min": 4, "bootstrap": 1000}
+  "stats": {"seeds_min": 4, "bootstrap": 1000, "min_units": 30}
 }
 ```
 
-규칙: 어떤 스크립트도 읽지 않는 값은 넣지 않는다. `stats`를 빼면 코드 기본값(seeds_min 4, bootstrap 1000)을 쓴다. 데이터 버전은 팩이 아니라 런 태그 `data_version`이다.
+규칙: 어떤 스크립트도 읽지 않는 값은 넣지 않는다. `stats`를 빼면 코드 기본값(seeds_min 4, bootstrap 1000, min_units 30)을 쓴다. 게이트가 있는 지표는 select 세트 쌍둥이(`dev/f1`)를 함께 둔다. `decide`는 select 세트 지표로 판정한다. 데이터 버전은 팩이 아니라 런 태그 `data_version`이다.
 
 `agg`는 단위 점수를 모으는 방법이다. `{"type": "mean", "field": "x"}`는 단위 값의 평균, `{"type": "f1", "tp", "fp", "fn"}`은 단위별 개수를 더한 뒤 micro F1(단위별 F1의 평균이 아님).
 
@@ -106,10 +109,11 @@ imozuru는 플러그인에 넣지 않는다. 설치된 imozuru 스킬을 호출�
 |---|---|
 | experiment | `project.json` stages[].experiment |
 | run name | 유일, 결과 폴더 이름과 같음. seed는 `_s<N>` 접미사 |
-| tags | `status`(`running`/`done`/`smoke`/`frozen`/`aborted`), `stage`, `sweep`(쉼표 목록), `variation`, `compare`, `axis`, `idea`, `insight`, `review`, `intro`, `result`, `data_version`, `budget`(`short`/`full`), `accepted`(`yes`), `gate_<set>`, `reopen_if`(frozen일 때) |
+| tags | `status`(`running`/`done`/`smoke`/`frozen`/`aborted`), `stage`, `sweep`(쉼표 목록), `variation`, `compare`, `axis`, `idea`, `insight`, `review`, `intro`, `result`, `data_version`, `budget`(`short`/`full`, 없으면 full), `accepted`(`yes`, `decide` accept 뒤), `gate_<set>`(`decide`의 지표별 판정), `reopen_if`(frozen일 때) |
 | metrics | `<eval set>/<name>`. 같은 키끼리만 비교. 런이 CI를 직접 기록하면 `<set>/ci_lo_<name>`, `<set>/ci_hi_<name>` |
-| artifact `units.jsonl` | 줄마다 `{"set", "unit", <agg가 읽는 필드>}`(예 tp, fp, fn). CI와 짝 차이는 엔진이 계산 |
+| artifact `units.jsonl` | 줄마다 `{"set", "unit", <agg가 읽는 필드>}`(예 tp, fp, fn). 세트 안에서 unit id 중복 금지. CI와 짝 차이는 엔진이 계산 |
 | leave-one-out | sweep 이름 `loo_<...>` |
+| 판정 기록 | 로컬 `.phro/ledger/decisions.jsonl`, `decide`가 한 줄씩 덧붙임(read_only 팩에서도 됨) |
 | 끝남 | 결과 폴더의 `DONE` 파일(작업반장이 봄). `pgrep` 금지 |
 
 표준 결과 폴더(`phro_sync.py`가 읽음): `run.json`(name, stage, params, tags), `metrics.jsonl`(`{"step", "set", "key", "value"}`, 최종값은 `"step": "final"`), `units.jsonl`, `DONE`. 학습 코드가 쓰는 예시 10줄은 `references/contract.md`에 둔다.
@@ -127,12 +131,16 @@ imozuru는 플러그인에 넣지 않는다. 설치된 imozuru 스킬을 호출�
 | `status` | GPU별 런, 진행률, 남은 시간, FREE, 대기 스크립트 |
 | `list [--exp]` | 런·sweep 이름 |
 | `report --run N` / `--since H` | 판정 줄 + CI + compare 태그 런 |
-| `compare A B ... [--set S]` / `--sweep S` | 같은 키 나란히, CI, 게이트 |
+| `compare A B ... [--set S]` / `--sweep S` | 같은 키 나란히, CI, 게이트. 기본 세트는 select |
 | `diff NEW --vs OLD` | 실제 파라미터 차이(선언한 축 밖이면 교란) |
-| `ci A B ...` | `units.jsonl`로 런별 95% bootstrap CI + 같은 단위 재표집 짝 차이 |
+| `ci A B ...` | `units.jsonl`로 런별 95% bootstrap CI + 같은 단위 재표집 짝 차이. 단위 잡음만 보므로 판정 없음 |
+| `ci BASE ARM --pairs` | 런 가족(`<가족>_s<N>`)의 seed 짝 차이, t 구간(seed 분산 + 단위 분산), 게이트 판정 |
+| `decide BASE ARM` | 단계의 select 지표 전부로 채택 판정(accept, accept-short, reject, undecided), `decisions.jsonl`에 기록. `--reverify`, `--loo` |
+| `loo --stage S --data V` | leave-one-out으로 시험 안 된 채택과 변경마다 만들 갈래 |
+| `splitcheck RUN` | select·heldout·final 사이 겹치는 unit id 수(0이어야 함) |
 | `baseline [--data V]` | 데이터 버전 baseline 표: 단계별 런 가족(seed 접미사 제거), seed 수, 평균 [min, max], 목표까지 거리 |
 | `cascade --stage S` | `depends_on` DAG로 S가 바뀌면 다시 학습할 끝난 런 목록 |
-| `audit` | 누락 태그(intro/result/review), 끝났는데 sync 안 됨, GPU 놀면서 스크립트 대기, look_budget 초과, 쌓인 채택 3개 이상인데 leave-one-out 없음 |
+| `audit` | 누락 태그(intro/result/review), 끝났는데 sync 안 됨, GPU 놀면서 스크립트 대기, look_budget 초과(데이터 버전마다 런 가족 수), leave-one-out 안 된 채택 3개 이상, 재검증 안 된 단기 예산 통과 |
 | `manifest get|set` | 런 매니페스트 |
 
 ## 6. 온보딩 phro-onboard
@@ -187,10 +195,11 @@ imozuru는 플러그인에 넣지 않는다. 설치된 imozuru 스킬을 호출�
 ## 8. 격리와 반출 (단순화 대상 아님)
 
 1. 엔진 어디에서도 `gcloud`를 부르지 않는다. 원격 작업은 모두 `ssh <server.host>`.
-2. `hooks/guard.py`(PreToolUse, Bash·WebSearch·WebFetch)가 막는 것:
+2. `hooks/guard.py`(PreToolUse, Bash·PowerShell·Monitor·WebSearch·WebFetch)가 막는 것:
    - `gcloud compute instances ... (stop|delete|reset|start|create)`, `gcloud compute firewall-rules`
    - `server.allow_hosts`에 없는 호스트·IP로의 `ssh`/`scp`
-   - `egress.forbidden_terms`가 들어간 검색어·URL
+   - `egress.forbidden_terms`가 들어간 검색어·URL, 네트워크로 나가는 셸 명령(`curl`, `wget`, `gh`, `Invoke-WebRequest`, imozuru 수집 스크립트; 루프백 URL은 반출 아님), Monitor의 WebSocket URL
+   - 인코딩된 PowerShell(`-EncodedCommand`, `-e`). PowerShell 감싸기(`-Command`, 스크립트 블록, `Start-Process`, `iex`)는 안까지 최선을 다해 검사
    팩이 없으면 gcloud 규칙만 적용한다. 자체 점검 하나(`python guard.py selftest`).
 3. VM 위: `phro_server.py queue`는 빈 GPU에만 띄우고, 스스로 적은 PID만 멈춘다. 다른 세션·다른 프로젝트 작업은 죽이지 않는다.
 4. `phro_server.py setup`: `~/phro/<project>/` 아래에만 설치, sudo 없음, `systemctl --user`, cron 줄에 `# phro:<project>` 표시를 달고 표시 없는 줄은 건드리지 않음, MLflow는 `127.0.0.1`만, 포트가 쓰이고 있으면 중단.
@@ -198,11 +207,13 @@ imozuru는 플러그인에 넣지 않는다. 설치된 imozuru 스킬을 호출�
 
 ## 9. 통계 규칙 (sweep.md에 규칙으로)
 
-1. 채택: 같은 seed 짝 차이의 95% CI가 0을 벗어날 때만. 기본 seed 4개 이상. CI가 경계에 걸치면 "결정 안 됨"(실패 아님).
-2. 단기 예산(`budget=short`)으로 고른 것은 전체 예산으로 다시 확인한 뒤 채택.
-3. 채택된 변경이 3개 이상 쌓이면 baseline이라 부르기 전에 leave-one-out. 기여 없는 변경은 뺀다.
-4. 고르기는 select 세트, 판정은 heldout(`look_budget` 안에서), final은 마지막 한 번.
+1. 채택은 `phro.py decide <비교 가족> <갈래 가족>`으로만. 같은 seed 짝(`<가족>_s<N>`, `stats.seeds_min` 이상, 기본 4)과 공통 단위(`stats.min_units` 이상, 기본 30)에서, 단계의 select 세트 지표마다 seed별 차이의 평균에 t 구간을 씌운다(자유도 = 짝 수 - 1, 분산 = seed별 차이의 분산 / 짝 수 + 단위 재표집 분산). 지표가 모두 통과면 accept, 하나라도 미달이면 reject, 나머지는 undecided("결정 안 됨", 실패 아님). 판정은 `.phro/ledger/decisions.jsonl`에 쌓인다. 런 하나짜리 `ci`는 단위 잡음만 보므로 판정에 쓰지 않는다.
+2. 단기 예산(`budget=short`) 갈래는 accept-short까지만 간다. 전체 예산으로 새 가족을 돌려 `decide <비교> <새 가족> --reverify <단기 가족>`이 accept여야 채택. `audit`이 재검증(accept 또는 reject) 안 된 것을 알린다. 같은 갈래를 seed를 늘려 다시 판정하면 앞 판정을 대신한다. 끝난 런(`status=done`)만 짝짓는다.
+3. 단계·데이터 버전마다 leave-one-out으로 시험 안 된 채택이 3개 이상이면 baseline이라 부르기 전에 leave-one-out. `loo`가 변경마다 갈래(그 변경만 뺀 스택)를 내고, `decide <갈래> <스택> --loo <변경 가족>`으로 하나씩 닫는다. reject면 뺀다. undecided면 seed를 늘리거나 더 단순한 스택을 고른다.
+4. 고르기는 select 세트, 판정은 heldout(`look_budget` 안에서, 데이터 버전마다 런 가족 수로 셈), final은 마지막 한 번. `splitcheck`로 세트 사이 unit id 겹침이 0인지 본다.
 5. 구조·방법 축은 에이전트 sweep, 방법이 정해진 뒤 수치 HPO는 Optuna TPE + pruner. 구조적으로 실패한 방법은 HPO하지 않는다.
+
+보정(seed 잡음을 넣은 시뮬레이션, 단위 1000개, seed 4쌍, 각 200회): 효과 0에서 잘못된 통과 0/200, 잘못된 미달 5/200. 검정력은 +3점 59%, +5점 96%. 이전 방식(런 하나의 단위 bootstrap 짝 차이)은 같은 조건, 효과 0에서 잘못된 통과 18%, 잘못된 미달 12%였다.
 
 ## 10. 시험
 
